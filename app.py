@@ -6,6 +6,7 @@ import uuid
 import os
 import json
 from datetime import datetime
+import time
 
 # Create folders for data storage if they don't exist
 os.makedirs("data", exist_ok=True)
@@ -16,6 +17,7 @@ CANDIDATES_FILE = "data/candidates.json"
 ELECTORAL_BOXES_FILE = "data/electoral_boxes.json"
 VOTES_FILE = "data/votes.json"
 VOTE_COUNTS_FILE = "data/vote_counts.json"
+OFFLINE_VOTES_FILE = "data/offline_votes.json"
 
 # Initialize data files if they don't exist
 def initialize_data_files():
@@ -45,6 +47,10 @@ def initialize_data_files():
             
     if not os.path.exists(VOTE_COUNTS_FILE):
         with open(VOTE_COUNTS_FILE, "w") as f:
+            json.dump({}, f)
+            
+    if not os.path.exists(OFFLINE_VOTES_FILE):
+        with open(OFFLINE_VOTES_FILE, "w") as f:
             json.dump({}, f)
 
 # Load data
@@ -84,13 +90,14 @@ def add_user(username, password, role):
     save_data(users, USERS_FILE)
     return True, "User added successfully"
 
-# Add candidate function
-def add_candidate(name, party):
+# Add candidate function with category
+def add_candidate(name, party, category):
     candidates = load_data(CANDIDATES_FILE)
     candidate_id = str(uuid.uuid4())
     candidates[candidate_id] = {
         "name": name,
         "party": party,
+        "category": category,
         "created_at": datetime.now().isoformat()
     }
     save_data(candidates, CANDIDATES_FILE)
@@ -109,43 +116,76 @@ def add_electoral_box(name, location, registered_voters):
     save_data(boxes, ELECTORAL_BOXES_FILE)
     return True, "Electoral box added successfully"
 
-# Record a single vote
-def record_single_vote(box_id, candidate_ids, counter_username):
-    votes = load_data(VOTES_FILE)
-    
-    # Create a unique ID for this vote entry
+# Record a single vote (supports both online and offline storage)
+def record_single_vote(box_id, candidate_ids, counter_username, offline_mode=False):
     vote_id = str(uuid.uuid4())
+    timestamp = datetime.now().isoformat()
     
-    # Record the vote
-    if box_id not in votes:
-        votes[box_id] = {}
-    
-    votes[box_id][vote_id] = {
+    vote_data = {
         "candidates": candidate_ids,
         "recorded_by": counter_username,
-        "recorded_at": datetime.now().isoformat()
+        "recorded_at": timestamp
     }
     
-    save_data(votes, VOTES_FILE)
-    
-    # Also update the vote counts for easier reporting
-    vote_counts = load_data(VOTE_COUNTS_FILE)
-    
-    if box_id not in vote_counts:
-        vote_counts[box_id] = {}
-    
-    for candidate_id in candidate_ids:
-        if candidate_id not in vote_counts[box_id]:
-            vote_counts[box_id][candidate_id] = 0
-        vote_counts[box_id][candidate_id] += 1
-    
-    save_data(vote_counts, VOTE_COUNTS_FILE)
-    
-    return True
+    if offline_mode:
+        # Store vote in offline storage
+        offline_votes = load_data(OFFLINE_VOTES_FILE)
+        if box_id not in offline_votes:
+            offline_votes[box_id] = {}
+        
+        offline_votes[box_id][vote_id] = vote_data
+        save_data(offline_votes, OFFLINE_VOTES_FILE)
+        return True
+    else:
+        # Store vote in main storage
+        votes = load_data(VOTES_FILE)
+        if box_id not in votes:
+            votes[box_id] = {}
+        
+        votes[box_id][vote_id] = vote_data
+        save_data(votes, VOTES_FILE)
+        
+        # Also update the vote counts for easier reporting
+        vote_counts = load_data(VOTE_COUNTS_FILE)
+        
+        if box_id not in vote_counts:
+            vote_counts[box_id] = {}
+        
+        for candidate_id in candidate_ids:
+            if candidate_id not in vote_counts[box_id]:
+                vote_counts[box_id][candidate_id] = 0
+            vote_counts[box_id][candidate_id] += 1
+        
+        save_data(vote_counts, VOTE_COUNTS_FILE)
+        
+        return True
 
 # Record invalid vote
-def record_invalid_vote(box_id, counter_username):
-    return record_single_vote(box_id, ["invalid"], counter_username)
+def record_invalid_vote(box_id, counter_username, offline_mode=False):
+    return record_single_vote(box_id, ["invalid"], counter_username, offline_mode)
+
+# Sync offline votes with the main system
+def sync_offline_votes():
+    offline_votes = load_data(OFFLINE_VOTES_FILE)
+    if not offline_votes:
+        return 0  # No votes to sync
+    
+    synced_count = 0
+    
+    for box_id, box_votes in offline_votes.items():
+        for vote_id, vote_data in box_votes.items():
+            # Get data from offline vote
+            candidate_ids = vote_data["candidates"]
+            counter_username = vote_data["recorded_by"]
+            
+            # Record in main system
+            record_single_vote(box_id, candidate_ids, counter_username)
+            synced_count += 1
+    
+    # Clear offline votes after successful sync
+    save_data({}, OFFLINE_VOTES_FILE)
+    
+    return synced_count
 
 # Get total votes by candidate
 def get_total_votes():
@@ -179,11 +219,22 @@ def get_counting_progress():
     
     return (counted_boxes / total_boxes) * 100
 
+# Get available categories from candidates
+def get_categories():
+    candidates = load_data(CANDIDATES_FILE)
+    categories = set()
+    
+    for cid, details in candidates.items():
+        if "category" in details:
+            categories.add(details["category"])
+    
+    return sorted(list(categories))
+
 # Admin dashboard
 def admin_dashboard():
     st.title("Admin Dashboard")
     
-    tab1, tab2, tab3, tab4 = st.tabs(["Users", "Candidates", "Electoral Boxes", "Results"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Users", "Candidates", "Electoral Boxes", "Results", "Offline Votes"])
     
     with tab1:
         st.header("Add User")
@@ -212,10 +263,15 @@ def admin_dashboard():
         st.header("Add Candidate")
         candidate_name = st.text_input("Candidate Name")
         candidate_party = st.text_input("Party")
+        # Add category field
+        candidate_category = st.text_input("Category (e.g., President, Senator, Governor)")
         
         if st.button("Add Candidate"):
-            success, message = add_candidate(candidate_name, candidate_party)
-            st.write(message)
+            if candidate_name and candidate_party and candidate_category:
+                success, message = add_candidate(candidate_name, candidate_party, candidate_category)
+                st.write(message)
+            else:
+                st.error("All fields are required")
         
         st.header("Existing Candidates")
         candidates = load_data(CANDIDATES_FILE)
@@ -224,7 +280,8 @@ def admin_dashboard():
             candidate_data.append({
                 "ID": cid,
                 "Name": details["name"],
-                "Party": details["party"]
+                "Party": details["party"],
+                "Category": details.get("category", "Uncategorized")
             })
         
         if candidate_data:
@@ -256,8 +313,45 @@ def admin_dashboard():
     
     with tab4:
         display_results()
+    
+    with tab5:
+        st.header("Manage Offline Votes")
+        
+        # Show offline votes count
+        offline_votes = load_data(OFFLINE_VOTES_FILE)
+        offline_vote_count = sum(len(votes) for box_id, votes in offline_votes.items())
+        
+        st.write(f"Pending offline votes: {offline_vote_count}")
+        
+        if offline_vote_count > 0:
+            if st.button("Sync Offline Votes"):
+                synced = sync_offline_votes()
+                st.success(f"Successfully synced {synced} votes!")
+                # Force refresh
+                st.rerun()
+        
+        # Show offline votes by box
+        if offline_votes:
+            st.subheader("Offline Votes by Electoral Box")
+            offline_box_counts = {}
+            
+            for box_id, votes in offline_votes.items():
+                # Get box name
+                boxes = load_data(ELECTORAL_BOXES_FILE)
+                box_name = f"Unknown Box ({box_id})"
+                if box_id in boxes:
+                    box_name = f"{boxes[box_id]['name']} ({boxes[box_id]['location']})"
+                
+                offline_box_counts[box_name] = len(votes)
+            
+            offline_box_df = pd.DataFrame([
+                {"Electoral Box": box, "Pending Votes": count}
+                for box, count in offline_box_counts.items()
+            ])
+            
+            st.dataframe(offline_box_df)
 
-# Counter dashboard with improved vote entry interface
+# Counter dashboard with improved vote entry interface and offline support
 def counter_dashboard(username):
     st.title("Vote Counter Dashboard")
     
@@ -273,26 +367,45 @@ def counter_dashboard(username):
         st.warning("No candidates have been added yet.")
         return
     
+    # Offline mode toggle
+    offline_mode = st.toggle("Offline Mode", value=False, 
+                            help="Enable if you're working without internet connection. Votes will be stored locally and synced later.")
+    
+    # If offline mode is active, show banner
+    if offline_mode:
+        st.warning("?? OFFLINE MODE ACTIVE: Votes will be stored locally and need to be synced later.", icon="??")
+    
     # Select box to count
     box_options = {f"{details['name']} ({details['location']})": bid for bid, details in boxes.items()}
     selected_box_name = st.selectbox("Select Electoral Box", list(box_options.keys()))
     selected_box_id = box_options[selected_box_name]
     
-    # Get candidate information sorted by name
-    candidate_info = []
+    # Get candidate information and group by category
+    candidate_by_category = {}
     for cid, details in candidates.items():
-        candidate_info.append({
+        category = details.get("category", "Uncategorized")
+        if category not in candidate_by_category:
+            candidate_by_category[category] = []
+        
+        candidate_by_category[category].append({
             "id": cid,
             "name": details["name"],
-            "party": details["party"]
+            "party": details["party"],
+            "category": category
         })
     
-    # Sort candidates by name
-    candidate_info = sorted(candidate_info, key=lambda x: x["name"])
+    # Sort candidates by name within each category
+    for category in candidate_by_category:
+        candidate_by_category[category] = sorted(candidate_by_category[category], key=lambda x: x["name"])
     
     # Set up session state for tracking selections in current vote
     if "current_selections" not in st.session_state:
         st.session_state.current_selections = set()
+    
+    # Set up session state for selected category
+    if "selected_category" not in st.session_state:
+        categories = list(candidate_by_category.keys())
+        st.session_state.selected_category = categories[0] if categories else None
     
     # Function to toggle candidate selection
     def toggle_candidate(candidate_id):
@@ -307,40 +420,61 @@ def counter_dashboard(username):
             st.warning("No candidates selected. Please select at least one candidate or mark as invalid.")
             return
         
-        record_single_vote(selected_box_id, list(st.session_state.current_selections), username)
-        st.session_state.current_selections = set()
-        st.success("Vote recorded successfully!")
-        
-        # Update the vote counts display
-        vote_counts = load_data(VOTE_COUNTS_FILE)
-        box_counts = vote_counts.get(selected_box_id, {})
-        for i, candidate in enumerate(candidate_info):
-            st.session_state[f"count_{candidate['id']}"] = box_counts.get(candidate["id"], 0)
-        st.session_state[f"count_invalid"] = box_counts.get("invalid", 0)
-        
-        # Update total count
-        total = sum(box_counts.values())
-        st.session_state["total_count"] = total
+        success = record_single_vote(selected_box_id, list(st.session_state.current_selections), username, offline_mode)
+        if success:
+            st.session_state.current_selections = set()
+            
+            if offline_mode:
+                st.success("Vote recorded offline and will be synced later!")
+            else:
+                st.success("Vote recorded successfully!")
+                
+                # Update the vote counts display
+                vote_counts = load_data(VOTE_COUNTS_FILE)
+                box_counts = vote_counts.get(selected_box_id, {})
+                
+                # Update counts for all candidates
+                for category in candidate_by_category:
+                    for candidate in candidate_by_category[category]:
+                        st.session_state[f"count_{candidate['id']}"] = box_counts.get(candidate["id"], 0)
+                
+                st.session_state[f"count_invalid"] = box_counts.get("invalid", 0)
+                
+                # Update total count
+                total = sum(box_counts.values())
+                st.session_state["total_count"] = total
 
     # Function to submit invalid vote
     def submit_invalid():
-        record_invalid_vote(selected_box_id, username)
-        st.session_state.current_selections = set()
-        st.success("Invalid vote recorded!")
-        
-        # Update the invalid vote count display
-        vote_counts = load_data(VOTE_COUNTS_FILE)
-        box_counts = vote_counts.get(selected_box_id, {})
-        st.session_state[f"count_invalid"] = box_counts.get("invalid", 0)
-        
-        # Update total count
-        total = sum(box_counts.values())
-        st.session_state["total_count"] = total
+        success = record_invalid_vote(selected_box_id, username, offline_mode)
+        if success:
+            st.session_state.current_selections = set()
+            
+            if offline_mode:
+                st.success("Invalid vote recorded offline and will be synced later!")
+            else:
+                st.success("Invalid vote recorded!")
+                
+                # Update the invalid vote count display
+                vote_counts = load_data(VOTE_COUNTS_FILE)
+                box_counts = vote_counts.get(selected_box_id, {})
+                st.session_state[f"count_invalid"] = box_counts.get("invalid", 0)
+                
+                # Update total count
+                total = sum(box_counts.values())
+                st.session_state["total_count"] = total
     
     # Function to clear selections
     def clear_selections():
         st.session_state.current_selections = set()
         st.success("Selections cleared!")
+    
+    # Sync offline votes function for counter
+    def sync_votes_counter():
+        synced = sync_offline_votes()
+        st.success(f"Successfully synced {synced} votes!")
+        # Force refresh
+        st.rerun()
     
     # Display vote entry interface with buttons
     st.header("Quick Vote Entry")
@@ -355,13 +489,23 @@ def counter_dashboard(username):
     # Display current vote count
     st.subheader(f"Total votes recorded: {st.session_state['total_count']}")
     
+    # If there are offline votes and not in offline mode, show sync button
+    offline_votes = load_data(OFFLINE_VOTES_FILE)
+    offline_vote_count = sum(len(votes) for box_id, votes in offline_votes.items())
+    
+    if offline_vote_count > 0 and not offline_mode:
+        st.warning(f"You have {offline_vote_count} pending offline votes that need syncing.")
+        if st.button("Sync Offline Votes"):
+            sync_votes_counter()
+    
     # Display info about current selections
     if st.session_state.current_selections:
         selected_names = []
         for cid in st.session_state.current_selections:
-            for candidate in candidate_info:
-                if candidate["id"] == cid:
-                    selected_names.append(f"{candidate['name']} ({candidate['party']})")
+            for category in candidate_by_category:
+                for candidate in candidate_by_category[category]:
+                    if candidate["id"] == cid:
+                        selected_names.append(f"{candidate['name']} ({candidate['party']}) - {category}")
         
         st.write("Current selection:")
         for name in selected_names:
@@ -369,44 +513,49 @@ def counter_dashboard(username):
     else:
         st.info("No candidates selected for current vote")
     
-    # Create a grid layout for candidate buttons
-    cols_per_row = 3
+    # Category tabs
+    category_tabs = st.tabs(list(candidate_by_category.keys()))
     
     # Initialize counts for each candidate
-    for i, candidate in enumerate(candidate_info):
-        if f"count_{candidate['id']}" not in st.session_state:
-            st.session_state[f"count_{candidate['id']}"] = box_counts.get(candidate["id"], 0)
+    for category in candidate_by_category:
+        for candidate in candidate_by_category[category]:
+            if f"count_{candidate['id']}" not in st.session_state:
+                st.session_state[f"count_{candidate['id']}"] = box_counts.get(candidate["id"], 0)
     
     if f"count_invalid" not in st.session_state:
         st.session_state[f"count_invalid"] = box_counts.get("invalid", 0)
     
-    # Create rows of candidates
-    for i in range(0, len(candidate_info), cols_per_row):
-        cols = st.columns(cols_per_row)
-        for j in range(cols_per_row):
-            if i + j < len(candidate_info):
-                candidate = candidate_info[i + j]
-                with cols[j]:
-                    # Determine button color based on selection state
-                    button_key = f"candidate_{candidate['id']}"
-                    is_selected = candidate["id"] in st.session_state.current_selections
-                    button_label = f"{candidate['name']}\n({candidate['party']})\nCount: {st.session_state[f'count_{candidate['id']}']}"
-                    
-                    if is_selected:
-                        st.button(
-                            button_label, 
-                            key=button_key, 
-                            on_click=toggle_candidate,
-                            args=(candidate["id"],),
-                            type="primary"  # Highlight selected candidates
-                        )
-                    else:
-                        st.button(
-                            button_label, 
-                            key=button_key, 
-                            on_click=toggle_candidate,
-                            args=(candidate["id"],)
-                        )
+    # Create a grid layout for candidate buttons within each category tab
+    cols_per_row = 3
+    for i, category in enumerate(candidate_by_category):
+        with category_tabs[i]:
+            candidates_in_category = candidate_by_category[category]
+            for j in range(0, len(candidates_in_category), cols_per_row):
+                cols = st.columns(cols_per_row)
+                for k in range(cols_per_row):
+                    if j + k < len(candidates_in_category):
+                        candidate = candidates_in_category[j + k]
+                        with cols[k]:
+                            # Determine button color based on selection state
+                            button_key = f"candidate_{candidate['id']}"
+                            is_selected = candidate["id"] in st.session_state.current_selections
+                            button_label = f"{candidate['name']}\n({candidate['party']})\nCount: {st.session_state[f'count_{candidate['id']}']}"
+                            
+                            if is_selected:
+                                st.button(
+                                    button_label, 
+                                    key=button_key, 
+                                    on_click=toggle_candidate,
+                                    args=(candidate["id"],),
+                                    type="primary"  # Highlight selected candidates
+                                )
+                            else:
+                                st.button(
+                                    button_label, 
+                                    key=button_key, 
+                                    on_click=toggle_candidate,
+                                    args=(candidate["id"],)
+                                )
     
     # Create action buttons for vote submission
     col1, col2, col3 = st.columns(3)
@@ -466,43 +615,85 @@ def counter_dashboard(username):
     
     # Show current results for this electoral box
     st.header(f"Results for {selected_box_name}")
-    box_results = []
     
-    for candidate in candidate_info:
-        count = box_counts.get(candidate["id"], 0)
-        box_results.append({
-            "Candidate": candidate["name"],
-            "Party": candidate["party"],
-            "Votes": count
-        })
+    # Create tabs for each category in results
+    result_categories = list(candidate_by_category.keys()) + ["Overall"]
+    result_tabs = st.tabs(result_categories)
     
-    # Add invalid votes
-    box_results.append({
+    # Initialize result data by category
+    results_by_category = {category: [] for category in candidate_by_category}
+    
+    for category in candidate_by_category:
+        for candidate in candidate_by_category[category]:
+            count = box_counts.get(candidate["id"], 0)
+            results_by_category[category].append({
+                "Candidate": candidate["name"],
+                "Party": candidate["party"],
+                "Category": category,
+                "Votes": count
+            })
+    
+    # Add invalid votes to a general category
+    invalid_votes = {
         "Candidate": "Invalid Votes",
         "Party": "N/A",
+        "Category": "Invalid",
         "Votes": box_counts.get("invalid", 0)
-    })
+    }
     
-    if box_results:
-        box_results_df = pd.DataFrame(box_results)
-        st.dataframe(box_results_df)
+    # Display results by category
+    for i, category in enumerate(candidate_by_category):
+        with result_tabs[i]:
+            if results_by_category[category]:
+                category_df = pd.DataFrame(results_by_category[category])
+                st.dataframe(category_df)
+                
+                # Bar chart of results for this category
+                total_votes_category = sum(c["Votes"] for c in results_by_category[category])
+                if total_votes_category > 0:
+                    fig = px.bar(
+                        category_df, 
+                        x="Candidate", 
+                        y="Votes", 
+                        color="Party", 
+                        title=f"{category} Vote Distribution for {selected_box_name}"
+                    )
+                    st.plotly_chart(fig)
+            else:
+                st.info(f"No votes recorded for {category} yet.")
+    
+    # Display overall results
+    with result_tabs[-1]:
+        # Combine all category results
+        all_results = []
+        for category in results_by_category:
+            all_results.extend(results_by_category[category])
         
-        # Bar chart of results
-        total_votes = sum(box_counts.values())
-        if total_votes > 0:
-            fig = px.bar(
-                box_results_df, 
-                x="Candidate", 
-                y="Votes", 
-                color="Party", 
-                title=f"Vote Distribution for {selected_box_name}"
-            )
-            st.plotly_chart(fig)
+        # Add invalid votes
+        all_results.append(invalid_votes)
+        
+        if all_results:
+            all_results_df = pd.DataFrame(all_results)
+            st.dataframe(all_results_df)
+            
+            # Bar chart of overall results
+            total_votes = sum(r["Votes"] for r in all_results)
+            if total_votes > 0:
+                fig = px.bar(
+                    all_results_df, 
+                    x="Candidate", 
+                    y="Votes", 
+                    color="Category", 
+                    title=f"Overall Vote Distribution for {selected_box_name}"
+                )
+                st.plotly_chart(fig)
+        else:
+            st.info("No votes recorded yet.")
     
     # Show overall results as well
     display_results()
 
-# Display results and dashboard
+# Display results and dashboard with category segregation
 def display_results():
     st.header("Overall Election Results")
     
@@ -510,132 +701,15 @@ def display_results():
     results = get_total_votes()
     candidates = load_data(CANDIDATES_FILE)
     
-    # Prepare data for visualization
-    result_data = []
-    for cid, votes in results.items():
-        if cid == "invalid":
-            name = "Invalid Votes"
-            party = "N/A"
-        else:
-            if cid in candidates:
-                name = candidates[cid]["name"]
-                party = candidates[cid]["party"]
-            else:
-                continue
+    # Get categories and organize candidates by category
+    candidates_by_category = {}
+    for cid, details in candidates.items():
+        category = details.get("category", "Uncategorized")
+        if category not in candidates_by_category:
+            candidates_by_category[category] = []
         
-        result_data.append({
-            "Candidate": name,
-            "Party": party,
-            "Votes": votes
+        candidates_by_category[category].append({
+            "id": cid,
+            "name": details["name"],
+            "party": details["party"]
         })
-    
-    # Display results table
-    if result_data:
-        result_df = pd.DataFrame(result_data)
-        st.dataframe(result_df)
-        
-        # Bar chart of results
-        if sum(results.values()) > 0:  # Only show chart if there are votes
-            fig = px.bar(
-                result_df, 
-                x="Candidate", 
-                y="Votes", 
-                color="Party", 
-                title="Overall Vote Distribution"
-            )
-            st.plotly_chart(fig)
-            
-            # Pie chart for percentage distribution
-            fig2 = px.pie(
-                result_df, 
-                values="Votes", 
-                names="Candidate",
-                title="Vote Share by Candidate",
-                hover_data=["Party"]
-            )
-            st.plotly_chart(fig2)
-    else:
-        st.info("No votes recorded yet.")
-    
-    # Counting progress
-    progress = get_counting_progress()
-    st.write(f"Counting Progress: {progress:.1f}%")
-
-# Public dashboard
-def public_dashboard():
-    st.title("Election Results - Public View")
-    display_results()
-
-# Main app
-def main():
-    # Initialize data files
-    initialize_data_files()
-    
-    # Set page config
-    st.set_page_config(
-        page_title="Election Results Management System",
-        page_icon="???",
-        layout="wide"
-    )
-    
-    # Add custom CSS for improved button styling
-    st.markdown("""
-    <style>
-    .stButton button {
-        height: 100px;
-        white-space: pre-wrap;
-        word-wrap: break-word;
-        text-align: center;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # Session state initialization
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-        st.session_state.username = None
-        st.session_state.role = None
-    
-    # Sidebar for authentication
-    with st.sidebar:
-        st.title("Election Management")
-        
-        if st.session_state.authenticated:
-            st.write(f"Logged in as: {st.session_state.username}")
-            st.write(f"Role: {st.session_state.role}")
-            
-            if st.button("Logout"):
-                st.session_state.authenticated = False
-                st.session_state.username = None
-                st.session_state.role = None
-                st.rerun()
-        else:
-            st.header("Login")
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            
-            if st.button("Login"):
-                role = authenticate(username, password)
-                if role:
-                    st.session_state.authenticated = True
-                    st.session_state.username = username
-                    st.session_state.role = role
-                    st.success(f"Logged in as {role}")
-                    st.rerun()
-                else:
-                    st.error("Invalid username or password")
-    
-    # Main content based on authentication state and role
-    if st.session_state.authenticated:
-        if st.session_state.role == "admin":
-            admin_dashboard()
-        elif st.session_state.role == "counter":
-            counter_dashboard(st.session_state.username)
-        else:  # public or any other role
-            public_dashboard()
-    else:
-        # If not authenticated, show public dashboard only
-        public_dashboard()
-
-if __name__ == "__main__":
-    main()
